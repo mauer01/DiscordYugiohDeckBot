@@ -1,34 +1,41 @@
-use crate::deck::{extract_ydke_url, process_ydke};
+use crate::deck::process_deck_input;
 use crate::{Context, Error};
 use poise::serenity_prelude as serenity;
 
-/// Render a Yu-Gi-Oh! deck from a YDKE link into a compound image
+/// Render a Yu-Gi-Oh! deck from a YDKE link, YDK text/file, or XML into a compound image
 #[poise::command(slash_command)]
 pub async fn deck(
     ctx: Context<'_>,
-    #[description = "The YDKE link (ydke://...) or query"] query: String,
+    #[description = "The YDKE link (ydke://...), YDK text, or XML deck"] query: Option<String>,
+    #[description = "Optional .ydk or .xml file attachment"] file: Option<serenity::Attachment>,
 ) -> Result<(), Error> {
-    if query.contains("ydke://") {
-        ctx.defer().await?;
-        match process_ydke(&query) {
-            Ok(image_bytes) => {
-                let ydke_link = extract_ydke_url(&query).unwrap_or(&query);
-                let content = format!("```\n{}\n```", ydke_link);
-                let attachment = serenity::CreateAttachment::bytes(image_bytes, "deck.png");
-                ctx.send(
-                    poise::CreateReply::default()
-                        .content(content)
-                        .attachment(attachment),
-                )
-                .await?;
-            }
-            Err(e) => {
-                ctx.say(format!("Failed to generate deck image: {e}")).await?;
-            }
-        }
+    let input_text = if let Some(att) = file {
+        let bytes = att.download().await?;
+        String::from_utf8_lossy(&bytes).to_string()
+    } else if let Some(q) = query {
+        q
     } else {
-        let response = format!("Received search query: `{}`", query);
-        ctx.say(response).await?;
+        ctx.say("Please provide a YDKE link, YDK/XML text, or attach a .ydk/.xml file.")
+            .await?;
+        return Ok(());
+    };
+
+    ctx.defer().await?;
+    match process_deck_input(&input_text) {
+        Ok((deck, image_bytes)) => {
+            let ydke_link = deck.to_ydke_url();
+            let content = format!("```\n{}\n```", ydke_link);
+            let attachment = serenity::CreateAttachment::bytes(image_bytes, "deck.png");
+            ctx.send(
+                poise::CreateReply::default()
+                    .content(content)
+                    .attachment(attachment),
+            )
+            .await?;
+        }
+        Err(e) => {
+            ctx.say(format!("Failed to generate deck image: {e}")).await?;
+        }
     }
     Ok(())
 }

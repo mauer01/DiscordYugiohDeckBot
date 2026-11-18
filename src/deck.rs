@@ -5,7 +5,7 @@ use image::{ImageBuffer, ImageFormat, Rgba, RgbaImage};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-/// Represents a parsed Yu-Gi-Oh! deck from a YDKE link.
+/// Represents a parsed Yu-Gi-Oh! deck from a YDKE link, YDK file, or XML.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct YdkeDeck {
     pub main: Vec<u32>,
@@ -13,26 +13,57 @@ pub struct YdkeDeck {
     pub side: Vec<u32>,
 }
 
+impl YdkeDeck {
+    /// Encodes the deck into a standard `ydke://` URL.
+    pub fn to_ydke_url(&self) -> String {
+        let encode_section = |cards: &[u32]| -> String {
+            let mut bytes = Vec::with_capacity(cards.len() * 4);
+            for card in cards {
+                bytes.extend_from_slice(&card.to_le_bytes());
+            }
+            STANDARD.encode(&bytes)
+        };
+
+        let main_b64 = encode_section(&self.main);
+        let extra_b64 = encode_section(&self.extra);
+        let side_b64 = encode_section(&self.side);
+
+        format!("ydke://{main_b64}!{extra_b64}!{side_b64}!")
+    }
+}
+
 #[derive(Debug)]
-pub enum YdkeError {
+pub enum DeckError {
     InvalidScheme,
     InvalidSections,
     Base64DecodeError(String),
     InvalidByteLength(usize),
+    EmptyDeckOrInvalidFormat,
+    RenderError(String),
 }
 
-impl std::fmt::Display for YdkeError {
+pub type YdkeError = DeckError;
+
+impl std::fmt::Display for DeckError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            YdkeError::InvalidScheme => write!(f, "YDKE URL must start with 'ydke://'"),
-            YdkeError::InvalidSections => write!(f, "YDKE URL must contain main, extra, and side deck sections"),
-            YdkeError::Base64DecodeError(e) => write!(f, "Failed to decode base64: {e}"),
-            YdkeError::InvalidByteLength(len) => write!(f, "Decoded byte length ({len}) is not a multiple of 4"),
+            DeckError::InvalidScheme => write!(f, "YDKE URL must start with 'ydke://'"),
+            DeckError::InvalidSections => {
+                write!(f, "YDKE URL must contain main, extra, and side deck sections")
+            }
+            DeckError::Base64DecodeError(e) => write!(f, "Failed to decode base64: {e}"),
+            DeckError::InvalidByteLength(len) => {
+                write!(f, "Decoded byte length ({len}) is not a multiple of 4")
+            }
+            DeckError::EmptyDeckOrInvalidFormat => {
+                write!(f, "No valid cards found in input (invalid YDKE, YDK, or XML format)")
+            }
+            DeckError::RenderError(e) => write!(f, "Failed to render deck image: {e}"),
         }
     }
 }
 
-impl std::error::Error for YdkeError {}
+impl std::error::Error for DeckError {}
 
 /// Extracts the YDKE URL string from an input text.
 pub fn extract_ydke_url(input: &str) -> Option<&str> {
@@ -44,15 +75,15 @@ pub fn extract_ydke_url(input: &str) -> Option<&str> {
 }
 
 /// Scans and extracts a YDKE URL from a text query/message and parses it into `YdkeDeck`.
-pub fn parse_ydke(input: &str) -> Result<YdkeDeck, YdkeError> {
-    let ydke_url = extract_ydke_url(input).ok_or(YdkeError::InvalidScheme)?;
+pub fn parse_ydke(input: &str) -> Result<YdkeDeck, DeckError> {
+    let ydke_url = extract_ydke_url(input).ok_or(DeckError::InvalidScheme)?;
     let ydke_content = &ydke_url["ydke://".len()..];
 
     // YDKE sections are separated by '!'
     // Example: <main_b64>!<extra_b64>!<side_b64>!
     let parts: Vec<&str> = ydke_content.split('!').collect();
     if parts.len() < 3 {
-        return Err(YdkeError::InvalidSections);
+        return Err(DeckError::InvalidSections);
     }
 
     let main = decode_card_ids(parts[0])?;
@@ -62,8 +93,169 @@ pub fn parse_ydke(input: &str) -> Result<YdkeDeck, YdkeError> {
     Ok(YdkeDeck { main, extra, side })
 }
 
+/// Parses a `.ydk` deck format containing `#main`, `#extra`, and `!side` / `#side` sections.
+pub fn parse_ydk(input: &str) -> Result<YdkeDeck, DeckError> {
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum Section {
+        Main,
+        Extra,
+        Side,
+    }
+
+    let mut current_section: Option<Section> = None;
+    let mut main = Vec::new();
+    let mut extra = Vec::new();
+    let mut side = Vec::new();
+
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+        if lower == "#main" {
+            current_section = Some(Section::Main);
+            continue;
+        } else if lower == "#extra" {
+            current_section = Some(Section::Extra);
+            continue;
+        } else if lower == "!side" || lower == "#side" {
+            current_section = Some(Section::Side);
+            continue;
+        } else if trimmed.starts_with('#') || trimmed.starts_with('!') || trimmed.starts_with('$') {
+            // Comment or metadata line like "#created by ...", "$whitelist", etc.
+            continue;
+        }
+
+        if let Some(section) = current_section {
+            // Extract the first token / number on the line
+            let token = trimmed.split_whitespace().next().unwrap_or(trimmed);
+            if let Ok(card_id) = token.parse::<u32>() {
+                if card_id > 0 {
+                    match section {
+                        Section::Main => main.push(card_id),
+                        Section::Extra => extra.push(card_id),
+                        Section::Side => side.push(card_id),
+                    }
+                }
+            }
+        }
+    }
+
+    if main.is_empty() && extra.is_empty() && side.is_empty() {
+        return Err(DeckError::EmptyDeckOrInvalidFormat);
+    }
+
+    Ok(YdkeDeck { main, extra, side })
+}
+
+/// Parses an XML deck format containing `<main>`, `<extra>`, `<side>`, and `<card passcode="...">` tags.
+pub fn parse_xml(input: &str) -> Result<YdkeDeck, DeckError> {
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum Section {
+        Main,
+        Extra,
+        Side,
+    }
+
+    let mut current_section: Option<Section> = None;
+    let mut main = Vec::new();
+    let mut extra = Vec::new();
+    let mut side = Vec::new();
+
+    for line in input.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+
+        if lower.contains("<main>") || lower.starts_with("<main ") || lower == "<main>" {
+            current_section = Some(Section::Main);
+        }
+        if lower.contains("</main>") {
+            current_section = None;
+        }
+        if lower.contains("<extra>") || lower.starts_with("<extra ") || lower == "<extra>" {
+            current_section = Some(Section::Extra);
+        }
+        if lower.contains("</extra>") {
+            current_section = None;
+        }
+        if lower.contains("<side>") || lower.starts_with("<side ") || lower == "<side>" {
+            current_section = Some(Section::Side);
+        }
+        if lower.contains("</side>") {
+            current_section = None;
+        }
+
+        if lower.contains("<card") {
+            if let Some(section) = current_section {
+                // Look for passcode attribute first, then id
+                if let Some(card_id) = extract_xml_attribute(trimmed, "passcode")
+                    .or_else(|| extract_xml_attribute(trimmed, "id"))
+                {
+                    match section {
+                        Section::Main => main.push(card_id),
+                        Section::Extra => extra.push(card_id),
+                        Section::Side => side.push(card_id),
+                    }
+                }
+            }
+        }
+    }
+
+    if main.is_empty() && extra.is_empty() && side.is_empty() {
+        return Err(DeckError::EmptyDeckOrInvalidFormat);
+    }
+
+    Ok(YdkeDeck { main, extra, side })
+}
+
+fn extract_xml_attribute(line: &str, attr: &str) -> Option<u32> {
+    let pattern = format!("{attr}=\"");
+    let pattern_single = format!("{attr}='");
+
+    let val_str = if let Some(idx) = line.to_ascii_lowercase().find(&pattern) {
+        let start = idx + pattern.len();
+        let end = line[start..].find('"')? + start;
+        &line[start..end]
+    } else if let Some(idx) = line.to_ascii_lowercase().find(&pattern_single) {
+        let start = idx + pattern_single.len();
+        let end = line[start..].find('\'')? + start;
+        &line[start..end]
+    } else {
+        return None;
+    };
+
+    val_str.trim().parse::<u32>().ok()
+}
+
+/// Automatically detects and parses a deck from YDKE, YDK, or XML input.
+pub fn parse_deck(input: &str) -> Result<YdkeDeck, DeckError> {
+    let trimmed = input.trim();
+    if trimmed.contains("ydke://") {
+        parse_ydke(trimmed)
+    } else if trimmed.to_ascii_lowercase().contains("<deck")
+        || trimmed.to_ascii_lowercase().contains("<main>")
+        || trimmed.to_ascii_lowercase().contains("<card ")
+        || trimmed.to_ascii_lowercase().contains("<card>")
+    {
+        parse_xml(trimmed)
+    } else if trimmed.to_ascii_lowercase().contains("#main")
+        || trimmed.to_ascii_lowercase().contains("#extra")
+        || trimmed.to_ascii_lowercase().contains("!side")
+        || trimmed.to_ascii_lowercase().contains("#side")
+    {
+        parse_ydk(trimmed)
+    } else {
+        // Fallback trial in order
+        parse_ydke(trimmed)
+            .or_else(|_| parse_ydk(trimmed))
+            .or_else(|_| parse_xml(trimmed))
+    }
+}
+
 /// Decodes a base64 string into a list of 32-bit little-endian card IDs.
-fn decode_card_ids(b64_str: &str) -> Result<Vec<u32>, YdkeError> {
+fn decode_card_ids(b64_str: &str) -> Result<Vec<u32>, DeckError> {
     if b64_str.is_empty() {
         return Ok(Vec::new());
     }
@@ -74,10 +266,10 @@ fn decode_card_ids(b64_str: &str) -> Result<Vec<u32>, YdkeError> {
         .or_else(|_| STANDARD_NO_PAD.decode(b64_str))
         .or_else(|_| URL_SAFE.decode(b64_str))
         .or_else(|_| URL_SAFE_NO_PAD.decode(b64_str))
-        .map_err(|e| YdkeError::Base64DecodeError(e.to_string()))?;
+        .map_err(|e| DeckError::Base64DecodeError(e.to_string()))?;
 
     if decoded.len() % 4 != 0 {
-        return Err(YdkeError::InvalidByteLength(decoded.len()));
+        return Err(DeckError::InvalidByteLength(decoded.len()));
     }
 
     let card_ids = decoded
@@ -102,7 +294,7 @@ impl Default for DeckRenderConfig {
     fn default() -> Self {
         let card_images_dir = std::env::var("CARD_IMAGES_PATH")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/home/vince/Programme/ProjectIgnis/pics"));
+            .unwrap_or_else(|_| PathBuf::from("/app/pics"));
 
         // Base main card dimensions matching standard Yu-Gi-Oh card ratio (~177x254)
         // With main_card_width = 120 and height = 172:
@@ -219,6 +411,14 @@ pub fn generate_deck_image_bytes(deck: &YdkeDeck, config: &DeckRenderConfig) -> 
     let mut bytes = Vec::new();
     img.write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
     Ok(bytes)
+}
+
+/// Automatically parses a deck from any supported format (YDKE, YDK, XML) and generates the compound image PNG bytes.
+pub fn process_deck_input(input: &str) -> Result<(YdkeDeck, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    let deck = parse_deck(input)?;
+    let config = DeckRenderConfig::default();
+    let image_bytes = generate_deck_image_bytes(&deck, &config)?;
+    Ok((deck, image_bytes))
 }
 
 /// Scans, validates, transforms a YDKE URL and generates the compound image PNG bytes.
@@ -355,6 +555,89 @@ mod tests {
         let bytes = process_ydke(ydke_url).expect("should process ydke to png bytes");
         assert!(!bytes.is_empty());
         // Verify it starts with PNG header [137, 80, 78, 71, 13, 10, 26, 10]
+        assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+    }
+
+    #[test]
+    fn test_to_ydke_url() {
+        let deck = YdkeDeck {
+            main: vec![32864],
+            extra: vec![32864],
+            side: vec![32864],
+        };
+        let encoded = deck.to_ydke_url();
+        let parsed = parse_ydke(&encoded).expect("should parse re-encoded ydke url");
+        assert_eq!(deck, parsed);
+    }
+
+    #[test]
+    fn test_parse_ydk_format() {
+        let ydk_content = r#"
+#created by Mermail Player
+#main
+74311226
+37104630
+0706925
+#extra
+26593852
+29071332
+!side
+40916023
+23434538
+"#;
+        let deck = parse_ydk(ydk_content).expect("should parse ydk format");
+        assert_eq!(deck.main, vec![74311226, 37104630, 706925]);
+        assert_eq!(deck.extra, vec![26593852, 29071332]);
+        assert_eq!(deck.side, vec![40916023, 23434538]);
+
+        // Test auto-detect parse_deck
+        let auto_deck = parse_deck(ydk_content).expect("should auto-detect ydk");
+        assert_eq!(deck, auto_deck);
+    }
+
+    #[test]
+    fn test_parse_xml_format() {
+        let xml_content = r#"
+<deck name="wizkalina-Mermail">
+<main>
+<card id="5543" passcode="74311226">Atlantean Dragoons</card>
+<card id="5532" passcode="37104630">Atlantean Heavy Infantry</card>
+<card id="5531" passcode="0706925">Atlantean Marksman</card>
+</main>
+<side>
+<card id="196" passcode="40916023">Aqua Spirit</card>
+<card id="2797" passcode="23434538">Maxx "C"</card>
+</side>
+<extra>
+<card id="85" passcode="26593852">Ally of Justice Catastor</card>
+<card id="253" passcode="29071332">Armory Arm</card>
+</extra>
+</deck>
+"#;
+        let deck = parse_xml(xml_content).expect("should parse xml format");
+        assert_eq!(deck.main, vec![74311226, 37104630, 706925]);
+        assert_eq!(deck.extra, vec![26593852, 29071332]);
+        assert_eq!(deck.side, vec![40916023, 23434538]);
+
+        // Test auto-detect parse_deck
+        let auto_deck = parse_deck(xml_content).expect("should auto-detect xml");
+        assert_eq!(deck, auto_deck);
+    }
+
+    #[test]
+    fn test_process_deck_input_xml_and_ydk() {
+        let xml_content = r#"
+<deck name="test">
+<main>
+<card id="1" passcode="32864">The 13th Grave</card>
+</main>
+<extra></extra>
+<side></side>
+</deck>
+"#;
+        let (deck, bytes) = process_deck_input(xml_content).expect("should process xml deck");
+        assert_eq!(deck.main, vec![32864]);
+        assert!(!bytes.is_empty());
         assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
     }
 }
