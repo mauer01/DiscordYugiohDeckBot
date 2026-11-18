@@ -3,6 +3,14 @@ name = "DiscordYugiohDeckBot"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "discord_yugioh_deck_bot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "DiscordYugiohDeckBot"
+path = "src/main.rs"
+
 [dependencies]
 base64 = "0.23.1"
 dotenvy = "0.15.7"
