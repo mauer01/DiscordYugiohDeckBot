@@ -640,4 +640,180 @@ mod tests {
         assert!(!bytes.is_empty());
         assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
     }
+
+    #[test]
+    fn test_deck_error_display() {
+        assert_eq!(
+            DeckError::InvalidScheme.to_string(),
+            "YDKE URL must start with 'ydke://'"
+        );
+        assert_eq!(
+            DeckError::InvalidSections.to_string(),
+            "YDKE URL must contain main, extra, and side deck sections"
+        );
+        assert_eq!(
+            DeckError::Base64DecodeError("err".into()).to_string(),
+            "Failed to decode base64: err"
+        );
+        assert_eq!(
+            DeckError::InvalidByteLength(5).to_string(),
+            "Decoded byte length (5) is not a multiple of 4"
+        );
+        assert_eq!(
+            DeckError::EmptyDeckOrInvalidFormat.to_string(),
+            "No valid cards found in input (invalid YDKE, YDK, or XML format)"
+        );
+        assert_eq!(
+            DeckError::RenderError("render failed".into()).to_string(),
+            "Failed to render deck image: render failed"
+        );
+    }
+
+    #[test]
+    fn test_extract_ydke_url_none() {
+        assert!(extract_ydke_url("no ydke link here").is_none());
+        assert!(extract_ydke_url("").is_none());
+    }
+
+    #[test]
+    fn test_extract_ydke_url_whitespace_and_newlines() {
+        let text = "  \n  ydke://YIAAAA==!YIAAAA!YIAAAA==!  \n some trailing text ";
+        let url = extract_ydke_url(text).expect("should extract url with whitespace");
+        assert_eq!(url, "ydke://YIAAAA==!YIAAAA!YIAAAA==!");
+    }
+
+    #[test]
+    fn test_parse_ydke_invalid_sections() {
+        let err = parse_ydke("ydke://onlyone").unwrap_err();
+        match err {
+            DeckError::InvalidSections => (),
+            other => panic!("Expected InvalidSections, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_ydke_invalid_base64() {
+        let err = parse_ydke("ydke://???invalid???!!!").unwrap_err();
+        match err {
+            DeckError::Base64DecodeError(_) => (),
+            other => panic!("Expected Base64DecodeError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_ydke_invalid_byte_length() {
+        // "AQID" decodes to 3 bytes [1, 2, 3], which is not divisible by 4
+        let err = parse_ydke("ydke://AQID!!!").unwrap_err();
+        match err {
+            DeckError::InvalidByteLength(3) => (),
+            other => panic!("Expected InvalidByteLength(3), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_ydke_url_safe_base64() {
+        // Generate bytes with high bits producing '-' and '_' in URL_SAFE base64
+        let card: u32 = 0xFBFF_FEFD;
+        let bytes = card.to_le_bytes();
+        let b64 = URL_SAFE_NO_PAD.encode(&bytes);
+        let ydke_url = format!("ydke://{b64}!!!",);
+        let deck = parse_ydke(&ydke_url).expect("should parse url-safe base64");
+        assert_eq!(deck.main, vec![card]);
+    }
+
+    #[test]
+    fn test_parse_ydk_with_hash_side_and_comments() {
+        let ydk = r#"
+#created by test
+$whitelist
+#main
+87910978 0 --Brain Control
+#extra
+50321796 --Brionac
+#side
+1475311 1 --Allure of Darkness
+"#;
+        let deck = parse_ydk(ydk).expect("should parse ydk with #side and comments");
+        assert_eq!(deck.main, vec![87910978]);
+        assert_eq!(deck.extra, vec![50321796]);
+        assert_eq!(deck.side, vec![1475311]);
+    }
+
+    #[test]
+    fn test_parse_ydk_empty_or_invalid() {
+        let ydk = "#created by nobody\n\n";
+        let err = parse_ydk(ydk).unwrap_err();
+        match err {
+            DeckError::EmptyDeckOrInvalidFormat => (),
+            other => panic!("Expected EmptyDeckOrInvalidFormat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_xml_single_quotes_and_id_fallback() {
+        let xml = r#"
+<deck>
+  <main>
+    <card passcode='74311226'>Atlantean Dragoons</card>
+    <card id="37104630">Atlantean Heavy Infantry</card>
+  </main>
+  <side>
+    <card id='40916023'>Aqua Spirit</card>
+  </side>
+  <extra>
+    <card passcode="26593852">Catastor</card>
+  </extra>
+</deck>
+"#;
+        let deck = parse_xml(xml).expect("should parse xml with quotes and id fallback");
+        assert_eq!(deck.main, vec![74311226, 37104630]);
+        assert_eq!(deck.side, vec![40916023]);
+        assert_eq!(deck.extra, vec![26593852]);
+    }
+
+    #[test]
+    fn test_parse_xml_empty_fails() {
+        let xml = "<deck><main></main><extra></extra><side></side></deck>";
+        let err = parse_xml(xml).unwrap_err();
+        match err {
+            DeckError::EmptyDeckOrInvalidFormat => (),
+            other => panic!("Expected EmptyDeckOrInvalidFormat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_deck_render_config_default() {
+        let config = DeckRenderConfig::default();
+        assert_eq!(config.main_cards_per_row, 10);
+        assert_eq!(config.main_rows, 6);
+        assert_eq!(config.extra_side_cards_per_row, 15);
+        assert_eq!(config.main_card_width, 120);
+        assert_eq!(config.main_card_height, 172);
+    }
+
+    #[test]
+    fn test_render_deck_multi_row_extra_and_side() {
+        let config = DeckRenderConfig::default();
+        // 16 cards in extra deck -> 2 rows in extra deck
+        // 31 cards in side deck -> 3 rows in side deck
+        let extra_cards = vec![32864; 16];
+        let side_cards = vec![32864; 31];
+        let deck = YdkeDeck {
+            main: vec![32864; 60],
+            extra: extra_cards,
+            side: side_cards,
+        };
+
+        let canvas = render_deck(&deck, &config).expect("should render deck with multiple rows");
+        assert_eq!(canvas.width(), 1200);
+
+        // Expected height calculation:
+        // main: 6 * 172 = 1032
+        // sep 1: 4
+        // side: 3 * (172 * 80 / 120) = 3 * 114 = 342
+        // sep 2: 4
+        // extra: 2 * 114 = 228
+        // total: 1032 + 4 + 342 + 4 + 228 = 1610
+        assert_eq!(canvas.height(), 1610);
+    }
 }
