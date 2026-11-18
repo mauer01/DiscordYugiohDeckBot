@@ -1,0 +1,11 @@
+[package]
+name = "DiscordYugiohDeckBot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23.1"
+dotenvy = "0.15.7"
+image = "0.25.10"
+poise = "0.7.1"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
